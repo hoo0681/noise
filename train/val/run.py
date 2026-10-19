@@ -1252,6 +1252,182 @@ class Relay(CutBI):
         return gradients
 
 
+class Probe(Cut):
+    """A reverse sweep in which every nonlinear derivative is measured by two forward evaluations (estimator 'probe').
+
+    Every operation of the model is a linear map or an elementwise nonlinearity of one or two arguments:
+      rms norm   n = x * s(q), q = mean(x^2), s(q) = (q + eps)^(-1/2)
+      softmax    a = e * (1 / S), e = exp(l - max l), S = sum(e)
+      head       15 tanh(raw / 15), then the cross-entropy log S + max - z_y
+      MLP        relu(h)^2;  gate 2 sigmoid(z);  products such as x * s and e * (1 / S)
+    The linear maps (weight matrices, the clean attention probabilities' transpose A^T, rotary, reshapes, the residual
+    and x0 mixing, the embedding gather) are transposed in closed form, as Relay (PR #20) takes its linear steps. The
+    derivative of every elementwise nonlinearity is measured by a central difference, (f(x + h) - f(x - h)) / 2h: two
+    forward evaluations of that scalar function at every element, the probe Relay's hidden_all uses for relu^2. The
+    partials of the products are measured the same way. Nothing is differentiated analytically and nothing uses
+    autograd. Chained from the loss down, the result is the gradient of the summed loss: this is backpropagation, with
+    each scalar derivative measured. It meets the rule as proposed in PR #20 ("no autograd, and no analytic derivative of
+    any nonlinear operation") to the letter; it does not meet "no hand-written backward pass" as the README states it.
+
+    The forward pass is recomputed here in float32 with every intermediate kept; the probes are evaluated in float64."""
+
+    STEP = 1e-3  # central-difference step, relative for the arguments that set a scale (q, S)
+
+    @staticmethod
+    def slope(f, x, h):
+        """Two forward evaluations of an elementwise function around x: its derivative at x (float64)."""
+        x = x.double()
+        return ((f(x + h) - f(x - h)) / (2 * h)).float()
+
+    def norm_vjp(self, x, g):
+        """Credit at x of n = x * s(mean(x^2)), every nonlinear derivative measured."""
+        h = self.STEP
+        q = x.square().mean(-1, keepdim=True)
+        s_of = lambda z: (z + EPS).rsqrt()
+        sq = s_of(q)
+        direct = g * self.slope(lambda xx: xx * sq.double(), x, h)
+        g_sq = (g * self.slope(lambda ss: x.double() * ss, sq, h)).sum(-1, keepdim=True)
+        g_q = g_sq * self.slope(s_of, q, h * q.double())
+        return direct + g_q * self.slope(lambda xx: xx * xx, x, h) / x.shape[-1]
+
+    def softmax_vjp(self, logits, g_a):
+        """Credit at the logits of a = e * (1 / S), e = exp(l - max), S = sum(e), every nonlinear derivative measured."""
+        h = self.STEP
+        l = logits - logits.amax(-1, keepdim=True)
+        e = l.exp()
+        S = e.sum(-1, keepdim=True)
+        inv = 1 / S
+        g_e = g_a * self.slope(lambda ee: ee * inv.double(), e, h)
+        g_inv = (g_a * self.slope(lambda ii: e.double() * ii, inv, h * inv.double())).sum(-1, keepdim=True)
+        g_e = g_e + g_inv * self.slope(lambda ss: 1 / ss, S, h * S.double())
+        return g_e * self.slope(torch.exp, l, h)
+
+    @staticmethod
+    def rotate(x, cos, sin):
+        d = x.shape[-1] // 2
+        return torch.cat([x[..., :d] * cos + x[..., d:] * sin, x[..., :d] * -sin + x[..., d:] * cos], -1)
+
+    @staticmethod
+    def rotate_t(g, cos, sin):
+        """The transpose of rotate (a rotation per pair of channels)."""
+        d = g.shape[-1] // 2
+        return torch.cat([g[..., :d] * cos - g[..., d:] * sin, g[..., :d] * sin + g[..., d:] * cos], -1)
+
+    @torch.no_grad()
+    def estimate(self, x, y):
+        model, cfg = self.model, self.model.config
+        b, t = x.shape
+        H, L, V = cfg.n_head, cfg.n_layer, cfg.vocab_size
+        hd = WIDTH // H
+        cos, sin = model.cos[:, :t].float(), model.sin[:, :t].float()
+        W = {n: p.float() for n, p in model.named_parameters()}
+        lam_r, lam_0 = W['resid_lambdas'], W['x0_lambdas']
+        pos = torch.arange(t, device=self.device)
+        lag = pos[:, None] - pos[None, :]  # query s minus key t
+        NEG = -1e30
+
+        # forward, every intermediate kept
+        e = W['transformer.wte.weight'][x]
+        x0 = norm(e)
+        stream, c = x0, []
+        for i in range(L):
+            p = f'transformer.h.{i}.attn.'
+            xin = lam_r[i] * stream + lam_0[i] * x0
+            n = norm(xin)
+            q = F.linear(n, W[p + 'c_q.weight']).view(b, t, H, hd)
+            k = F.linear(n, W[p + 'c_k.weight']).view(b, t, H, hd)
+            vals = F.linear(n, W[p + 'c_v.weight']).view(b, t, H, hd)
+            ve = z = gate = None
+            if has_ve(i, L):
+                ve = W[f'value_embeds.{i}.weight'][x].view(b, t, H, hd)
+                z = F.linear(n[..., :W[p + 've_gate.weight'].shape[1]], W[p + 've_gate.weight'])
+                gate = 2 * torch.sigmoid(z)
+                vals = vals + gate.unsqueeze(-1) * ve
+            qr, kr = self.rotate(q, cos, sin), self.rotate(k, cos, sin)
+            qp, kp = norm(qr), norm(kr)
+            allowed = (lag >= 0) & (lag <= model.window_sizes[i][0])
+            logits = torch.einsum('bshd,bthd->bhst', qp, kp) / math.sqrt(hd)
+            logits = logits.masked_fill(~allowed, NEG)
+            A = torch.softmax(logits, -1)
+            o = torch.einsum('bhst,bthd->bshd', A, vals).reshape(b, t, WIDTH)
+            mid = xin + F.linear(o, W[p + 'c_proj.weight'])
+            mn = norm(mid)
+            hpre = F.linear(mn, W[f'transformer.h.{i}.mlp.c_fc.weight'])
+            r = F.relu(hpre).square()
+            out = mid + F.linear(r, W[f'transformer.h.{i}.mlp.c_proj.weight'])
+            c.append(dict(xin=xin, n=n, qr=qr, kr=kr, qp=qp, kp=kp, vals=vals, ve=ve, z=z, gate=gate, logits=logits,
+                          A=A, allowed=allowed, o=o, mid=mid, mn=mn, hpre=hpre, r=r, out=out))
+            stream = out
+        xn = norm(stream)
+        head = W['lm_head.weight'][:V]
+        raw = F.linear(xn, head)
+        cap = lambda v: 15 * torch.tanh(v / 15)
+        zc = cap(raw)
+        valid = (y >= 0)
+        m = zc.amax(-1, keepdim=True)
+        ez = (zc - m).exp()
+        S = ez.sum(-1, keepdim=True)
+        loss = (S.log() + m).squeeze(-1) - zc.gather(-1, y.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+        self.capture.clean_loss = loss  # the step's logged train loss
+
+        # the reverse sweep
+        h = self.STEP
+        g = {}
+        onehot = F.one_hot(y.clamp(min=0), V).float()
+        g_zc = self.slope(torch.log, S, h * S.double()) * self.slope(torch.exp, zc - m, h) - onehot
+        g_raw = g_zc * self.slope(cap, raw, h) * valid.unsqueeze(-1)
+        g['lm_head.weight'] = F.pad(g_raw.flatten(0, 1).T @ xn.flatten(0, 1), (0, 0, 0, W['lm_head.weight'].shape[0] - V))
+        delta = self.norm_vjp(stream, g_raw @ head)
+        d_x0 = torch.zeros_like(x0)
+        relu2 = lambda u: F.relu(u).square()
+        sig2 = lambda u: 2 * torch.sigmoid(u)
+        flat = lambda a: a.reshape(-1, a.shape[-1])
+        for i in reversed(range(L)):
+            ci, p = c[i], f'transformer.h.{i}.'
+            w_out, w_fc = W[p + 'mlp.c_proj.weight'], W[p + 'mlp.c_fc.weight']
+            g[p + 'mlp.c_proj.weight'] = flat(delta).T @ flat(ci['r'])
+            g_h = (delta @ w_out) * self.slope(relu2, ci['hpre'], h)
+            g[p + 'mlp.c_fc.weight'] = flat(g_h).T @ flat(ci['mn'])
+            d_mid = delta + self.norm_vjp(ci['mid'], g_h @ w_fc)
+            g[p + 'attn.c_proj.weight'] = flat(d_mid).T @ flat(ci['o'])
+            g_o = (d_mid @ W[p + 'attn.c_proj.weight']).view(b, t, H, hd)
+            g_vals = torch.einsum('bhst,bshd->bthd', ci['A'], g_o)
+            g_A = torch.einsum('bshd,bthd->bhst', g_o, ci['vals'])
+            g_logits = self.softmax_vjp(ci['logits'], g_A) * ci['allowed']
+            g_qp = torch.einsum('bhst,bthd->bshd', g_logits, ci['kp']) / math.sqrt(hd)
+            g_kp = torch.einsum('bhst,bshd->bthd', g_logits, ci['qp']) / math.sqrt(hd)
+            g_q = self.rotate_t(self.norm_vjp(ci['qr'], g_qp), cos, sin).reshape(b, t, WIDTH)
+            g_k = self.rotate_t(self.norm_vjp(ci['kr'], g_kp), cos, sin).reshape(b, t, WIDTH)
+            g_v = g_vals.reshape(b, t, WIDTH)
+            n = ci['n']
+            for name, err in (('c_q', g_q), ('c_k', g_k), ('c_v', g_v)):
+                g[p + f'attn.{name}.weight'] = flat(err).T @ flat(n)
+            g_n = g_q @ W[p + 'attn.c_q.weight'] + g_k @ W[p + 'attn.c_k.weight'] + g_v @ W[p + 'attn.c_v.weight']
+            if ci['ve'] is not None:
+                w_g = W[p + 'attn.ve_gate.weight']
+                g_z = (g_vals * ci['ve']).sum(-1) * self.slope(sig2, ci['z'], h)
+                g[p + 'attn.ve_gate.weight'] = flat(g_z).T @ flat(n[..., :w_g.shape[1]])
+                g_n[..., :w_g.shape[1]] += g_z @ w_g
+                ve_err = (g_vals * ci['gate'].unsqueeze(-1)).reshape(-1, WIDTH)
+                g[f'value_embeds.{i}.weight'] = torch.zeros_like(W[f'value_embeds.{i}.weight']).index_add_(
+                    0, x.flatten(), ve_err)
+            d_in = d_mid + self.norm_vjp(ci['xin'], g_n)
+            prev = x0 if i == 0 else c[i - 1]['out']
+            g.setdefault('resid_lambdas', torch.zeros(L, device=self.device))[i] = (d_in * prev).sum()
+            g.setdefault('x0_lambdas', torch.zeros(L, device=self.device))[i] = (d_in * x0).sum()
+            d_x0 += lam_0[i] * d_in
+            if i:
+                delta = lam_r[i] * d_in
+            else:
+                d_x0 += lam_r[0] * d_in
+        g['transformer.wte.weight'] = torch.zeros_like(W['transformer.wte.weight']).index_add_(
+            0, x.flatten(), flat(self.norm_vjp(e, d_x0)))
+        for name, prm in model.named_parameters():
+            if name not in g:
+                g[name] = torch.zeros_like(prm, dtype=torch.float32)
+        return g
+
+
 class DFA(Cut):
     """Baseline (direct feedback alignment): Cut with every site's credit replaced by a fixed random projection of the
     exact output error (the coordinate head's logit credit), e @ B_site, B_site ~ N(0, 1 / V) drawn once from a fixed
@@ -1426,13 +1602,14 @@ def main():
                         '0 for relay, 0.3 otherwise).')
     parser.add_argument('--route-k', type=int, default=0, help='MLP units per token per block carrying a move (0: '
                         'hidden/4 for relay, hidden/16 otherwise).')
-    parser.add_argument('--estimator', choices=('relay', 'cut', 'cutbi', 'dfa'), default='relay', help='Phase 2 (cutbi: Cut '
+    parser.add_argument('--estimator', choices=('relay', 'probe', 'cut', 'cutbi', 'dfa'), default='relay', help='Phase 2 (cutbi: Cut '
                         'with the attention externalities by backward induction; dfa: the direct feedback alignment '
                         'baseline).')
     parser.add_argument('--keys', choices=('exact', 'sampled'), default='exact', help='Cut\'s keys.')
     parser.add_argument('--boost-keys', choices=('exact', 'sampled'), default='exact', help='Boost\'s keys.')
     parser.add_argument('--train-file', default='train.pt')
     parser.add_argument('--train-rows', type=int, default=TRAIN_ROWS)
+    parser.add_argument('--lr-scale', type=float, default=1.0, help='Multiplies the Adam and ANVIL II rates.')
     parser.add_argument('--test-file', default='', help='Also score the final weights on this split (e.g. test.pt).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many sequences.')
     parser.add_argument('--boost-probes', type=int, default=0, help='Boost: directions per token per readout '
@@ -1454,7 +1631,9 @@ def main():
     HIDDEN = 4 * WIDTH
     config = GPTConfig(n_layer=n_layer, n_head=WIDTH // 64, n_kv_head=WIDTH // 64, n_embd=WIDTH)
     recipe = Recipe()
-    relay = args.estimator == 'relay'
+    recipe.lr *= args.lr_scale
+    recipe.anvil_lr *= args.lr_scale
+    relay = args.estimator in ('relay', 'probe')
     if args.switch is None:
         args.switch = 0.0 if relay else 0.3
     settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or (HIDDEN // 4 if relay else HIDDEN // 16),
@@ -1511,7 +1690,7 @@ def main():
         estimator.close()
     model = make_model(device, args.seed, config)
     optimizer = make_optimizer(model, recipe, steps2)
-    Phase2 = dict(relay=Relay, cut=Cut, cutbi=CutBI, dfa=DFA)[args.estimator]
+    Phase2 = dict(relay=Relay, probe=Probe, cut=Cut, cutbi=CutBI, dfa=DFA)[args.estimator]
     estimator = Phase2(model, settings, args.seed, rank, world)
     mine = slice(rank * per2, (rank + 1) * per2)
     estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
