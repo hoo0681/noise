@@ -28,6 +28,13 @@ change is formed as a difference throughout (the query's change, its qk-norm's c
 p expm1(ds - dlse)), so rounding scales with the change. Only each token's top 64 keys per head by its clean attention
 move their logits; the other logits are held, and their keys' share of the output rescales exactly by exp(-dlse).
 
+Key hops (on by default). Credit also crosses positions where another token's query reads this token's key. The
+sites run from the top block down; each block's keys get their exact single-key credit (the record's closed-form key
+experiments) against its queries' targets, which need only the blocks above. One local step from that key credit
+gives a credit at the block's input: a full cycle of moves of each token's input stream, each scored by the change of
+its raw key against the key credit. Every later chain move that reaches the block's input is scored against it too.
+The same key credit trains c_k. Values do not cross positions (that would need the transposed attention product).
+
 The model, init, optimizer (ANVIL II on block matrices, Adam elsewhere), rates and schedule shape are the Noise
 record's. Boost runs at 4 sequences per update (two GPUs per sequence), Cut at 8 (one per GPU); the handoff keeps
 the weights, the optimizer state and the data order.
@@ -91,6 +98,7 @@ class Settings:
     cut_exact_keys: bool = True
     own_query: bool = True      # Cut: a move also reaches its own token's later attentions through its own query
     query_keys: int = 64        # own_query: keys per token per head whose logits move (0: all keys)
+    key_hops: bool = True       # Cut: credit also crosses positions through later attentions' keys (exact keys)
     key_sigma: float = 0.003
     key_chunk: int = 8
 
@@ -305,7 +313,7 @@ def query_change_routed(x, delta, pos, w_q, top_keys, top_values, top_p, rest, w
 
 
 def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0, w_fc, w_out_t, weight_t, base,
-                target_logit_w, y, own=None):
+                target_logit_w, y, own=None, hops=None):
     """Forward differences of each token's loss along every move of one site, attention held, MLPs restricted to
     each token's top-k units. site: -1 for the raw embedding, else the block whose mid stream moves. move (m, P, W);
     scale (m, P) the step each difference is divided by; e, x0, xL (m, W); mids per block (m, W); idx, hs per block
@@ -314,8 +322,10 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     or ('window', pos, rels, inputs, w_q, keys, values, w_proj_t, cos, sin, windows) with per-block key windows, or
     ('routed', pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, (cos, sin)) along strong keys, and then
     every block the move enters also changes its own token's attention through its own query (query_change).
-    Returns (m, P)."""
+    hops: None, or per block (m, W) the credit at the block's input through the other positions' use of the token's
+    key (the key hops); a change of the block input is then also scored against it. Returns (m, P)."""
     L = len(mids)
+    crossed = 0
     if site < 0:
         dx0 = norm(e.unsqueeze(1) + move) - x0.unsqueeze(1)
         delta, first = (lam_r[0] + lam_0[0]) * dx0, 0
@@ -324,6 +334,8 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     for b in range(first, L):
         if b > first:
             delta = lam_r[b] * delta + (lam_0[b] * dx0 if dx0 is not None else 0)
+        if hops is not None and (site < 0 or b > first):  # the other positions read the moved key
+            crossed = crossed + (delta * hops[b].unsqueeze(1)).sum(-1)
         if own is not None and (site < 0 or b > first):  # the move is at the block's input: its own query moves
             if own[0] == 'routed':  # strong keys only
                 _, pos, inputs, w_q, top_keys, top_values, top_p, rest, w_proj_t, cos_sin = own
@@ -347,7 +359,7 @@ def chain_chunk_eager(site, move, scale, e, x0, mids, xL, idx, hs, lam_r, lam_0,
     inv0 = torch.rsqrt(sq / WIDTH + EPS)
     clean = torch.exp(15 * torch.tanh(base * inv0 / 15)).sum(-1, keepdim=True).log() - 15 * torch.tanh(
         base.gather(1, y.clamp(min=0).unsqueeze(1)) * inv0 / 15)
-    return (moved - clean) / scale * (y >= 0).unsqueeze(1)
+    return (moved - clean + crossed) / scale * (y >= 0).unsqueeze(1)
 
 
 chain_chunk = torch.compile(chain_chunk_eager, dynamic=False)
@@ -633,7 +645,7 @@ class Boost:
             errors[site] = (estimate / (draws * sigma)).reshape(b, t, cfg.n_embd)
         return errors
 
-    def exact_key_errors(self, targets):
+    def exact_key_errors(self, targets, layers=None):
         """Key credit, one local step from the targets, by single-key experiments (key_scores): exact up to the
         one-sided step, with no interference between positions. The GPUs of a sequence split the directions."""
         d, model, s = self.capture, self.model, self.s
@@ -649,7 +661,7 @@ class Boost:
         eye = torch.eye(hd, device=self.device)
         lo, hi = self.share(hd)
         errors, self.key_credit = {}, {}
-        for i in range(L):
+        for i in (range(L) if layers is None else layers):
             prefix = f'transformer.h.{i}.attn.'
             allowed = ((lag >= 0) & (lag <= model.window_sizes[i][0])).float()
             credit_all = torch.zeros(b, h, t, hd, device=self.device)
@@ -866,12 +878,15 @@ class Cut(Boost):
         target_w = weight[y.clamp(min=0)]
         n, m, h = e.shape[0], s.chain_tokens, s.scalar_step
         credits = {}
+        hops = [torch.zeros(n, WIDTH, device=self.device) for _ in range(L)] if s.key_hops else None
+        self.hop_key_credit = {}
         own = None
         if s.own_query:
             own = self.own_query_inputs(n)
             if s.query_keys:
                 own = self.strong_keys(own, s.query_keys)
-        for site in [-1] + list(range(L)):
+        # with key hops, the sites run top down: a block's hop credit needs its own mid-stream credit first
+        for site in (list(range(L - 1, -1, -1)) + [-1] if s.key_hops else [-1] + list(range(L))):
             H = self.basis()
             probed = e if site < 0 else mids[site]
             steps = s.chain_sigma * probed.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
@@ -894,13 +909,17 @@ class Cut(Boost):
                 derivative = (chain_chunk if own is None or own[0] == 'routed' else chain_chunk_own)(
                     site, move, scale, e[sl], x0[sl], [z[sl] for z in mids], xL[sl], [r[0][sl] for r in routes],
                     [r[1][sl] for r in routes], lam_r, lam_0, w_fc, w_out_t, weight_t, base[sl], target_w[sl], y[sl],
-                    own_sl)
+                    own_sl, None if hops is None else [z[sl] for z in hops])
                 credit[sl] = derivative[:, :WIDTH] @ H / WIDTH
                 if site >= 0:
                     lam += (derivative[:, WIDTH:WIDTH + 2] + derivative[:, WIDTH + 2:]).sum(0) / 2
             credits['emb' if site < 0 else site] = credit
             if site >= 0:
                 credits['lam', site] = lam
+                if s.key_hops:  # this block's keys, scored against its queries' targets, and their hop credit
+                    target = (credit @ model.transformer.h[site].attn.c_proj.weight.float()).view(1, n, WIDTH)
+                    self.hop_key_credit[site] = self.layer_key_credit(site, target)
+                    hops[site] = self.key_hop_credit(site, self.hop_key_credit[site])
         return credits
 
     def own_query_inputs(self, n):
@@ -931,6 +950,45 @@ class Cut(Boost):
             w_proj_t.append(block.attn.c_proj.weight.float().T.contiguous())
             windows.append(model.window_sizes[i][0])
         return (torch.arange(T, device=self.device), inputs, w_q, keys, values, w_proj_t, cos, sin, windows)
+
+    def layer_key_credit(self, i, target):
+        """Layer i's key credit (b, h, t, hd) at the raw keys, one local step from the queries' targets (b, t, W):
+        exact_key_errors for one layer."""
+        self.exact_key_errors({i: target}, layers=[i])
+        return self.key_credit[i]
+
+    def key_hop_credit(self, i, key_credit):
+        """The credit at block i's input of each token through the other positions' use of its key: one local step
+        from the measured key credit. A full cycle of moves of the token's block input, each scored by the change
+        of its raw key (through the norm and the key projection) against its key credit. Returns (n, W)."""
+        d, s = self.capture, self.s
+        x = d.blocks[i].float().flatten(0, 1)
+        n = x.shape[0]
+        w_k = self.model.transformer.h[i].attn.c_k.weight.float()
+        credit = key_credit[0].transpose(0, 1).reshape(n, WIDTH)  # (t, h * hd), as c_k's output
+        H = self.basis()
+        steps = s.chain_sigma * x.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        out = torch.empty(n, WIDTH, device=self.device)
+        for t0 in range(0, n, 4 * s.chain_tokens):
+            sl = slice(t0, t0 + 4 * s.chain_tokens)
+            dk = norm_difference(x[sl], steps[sl].unsqueeze(-1) * H.unsqueeze(0)) @ w_k.T
+            out[sl] = ((dk * credit[sl].unsqueeze(1)).sum(-1) / steps[sl]) @ H / WIDTH
+        return out
+
+    def internals(self, gradients, targets, b, t, exact_keys):
+        if self.s.key_hops and exact_keys and self.hop_key_credit:  # the chain measured the keys already
+            for i, credit in self.hop_key_credit.items():
+                site = f'transformer.h.{i}.attn.c_k'
+                gradients[site + '.weight'] = self.capture.reassemble(
+                    site, credit.permute(0, 2, 1, 3).reshape(b, t, -1))
+            local = dict(self.s.local)
+            self.s.local = {k: v for k, v in local.items() if k != 'k'}
+            try:
+                super().internals(gradients, targets, b, t, exact_keys)
+            finally:
+                self.s.local = local
+            return
+        super().internals(gradients, targets, b, t, exact_keys)
 
     @staticmethod
     def strong_keys(own, k):
@@ -1271,6 +1329,8 @@ def main():
                         '(0: a full cycle; fewer: the forward-gradient local-loss baseline).')
     parser.add_argument('--own-query', action=argparse.BooleanOptionalAction, default=True, help='Cut: a move also '
                         'reaches its own token\'s later attentions through its own query (keys and values held clean).')
+    parser.add_argument('--key-hops', action=argparse.BooleanOptionalAction, default=True, help='Cut: credit also '
+                        'crosses positions through later attentions\' keys (exact keys, one local step to the stream).')
     parser.add_argument('--query-keys', type=int, default=64, help='own_query: keys per token per head whose logits '
                         'move (0: all keys).')
     parser.add_argument('--chain-tokens', type=int, default=0)
@@ -1292,7 +1352,7 @@ def main():
     recipe = Recipe()
     settings = Settings(fc_k=HIDDEN // 8, route_k=args.route_k or HIDDEN // 16,
                         cut_exact_keys=args.keys == 'exact', boost_exact_keys=args.boost_keys == 'exact',
-                        own_query=args.own_query, query_keys=args.query_keys)
+                        own_query=args.own_query, query_keys=args.query_keys, key_hops=args.key_hops)
     if args.boost_probes:
         settings.probes = args.boost_probes
     if args.chain_tokens:

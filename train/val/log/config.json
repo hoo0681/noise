@@ -51,6 +51,7 @@
     "cut_exact_keys": true,
     "own_query": true,
     "query_keys": 64,
+    "key_hops": true,
     "key_sigma": 0.003,
     "key_chunk": 8
   },

@@ -74,6 +74,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 8 | 3.991 | Reduce population to 16k | 1 h 12 min | [@serdardoesml](https://github.com/serdardoesml) |
 | 9 | 3.945 | Boost → Cut: stagewise readout training, then credit along strong routes | 8 min | [@spicylemonade](https://github.com/spicylemonade) |
 | 10 | 3.893 | Own queries in Cut: each move also reaches its own token's later attentions through its own query | 9 min (8×H200) | [@hoo0681](https://github.com/hoo0681) |
+| 11 | 3.789 | Key hops in Cut: credit also crosses positions where other tokens' queries read a token's key | 10 min (8×H200) | [@hoo0681](https://github.com/hoo0681) |
 
 ### Track 2: speedrun to 4.2
 
