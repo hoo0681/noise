@@ -1610,6 +1610,10 @@ def main():
     parser.add_argument('--train-file', default='train.pt')
     parser.add_argument('--train-rows', type=int, default=TRAIN_ROWS)
     parser.add_argument('--lr-scale', type=float, default=1.0, help='Multiplies the Adam and ANVIL II rates.')
+    parser.add_argument('--adam-scale', type=float, default=1.0, help='Multiplies the Adam rate only.')
+    parser.add_argument('--warmdown', type=float, default=None, help='Final fraction of the epoch with linear decay.')
+    parser.add_argument('--anvil-wd', type=float, default=None, help='ANVIL II weight decay.')
+    parser.add_argument('--cut-batch', type=int, default=8, help='Sequences per phase-2 update (a multiple of the GPUs).')
     parser.add_argument('--test-file', default='', help='Also score the final weights on this split (e.g. test.pt).')
     parser.add_argument('--eval-every', type=int, default=0, help='Untimed validation every this many sequences.')
     parser.add_argument('--boost-probes', type=int, default=0, help='Boost: directions per token per readout '
@@ -1633,6 +1637,11 @@ def main():
     recipe = Recipe()
     recipe.lr *= args.lr_scale
     recipe.anvil_lr *= args.lr_scale
+    recipe.lr *= args.adam_scale
+    if args.warmdown is not None:
+        recipe.warmdown = args.warmdown
+    if args.anvil_wd is not None:
+        recipe.anvil_wd = args.anvil_wd
     relay = args.estimator in ('relay', 'probe')
     if args.switch is None:
         args.switch = 0.0 if relay else 0.3
@@ -1644,7 +1653,7 @@ def main():
         settings.chain_tokens = args.chain_tokens
     if args.key_chunk:
         settings.key_chunk = args.key_chunk
-    batch1, batch2 = 4, 8
+    batch1, batch2 = 4, args.cut_batch
     if world % batch1 and batch1 % world or batch2 % world:
         raise ValueError('Run on 1, 2, 4 or 8 GPUs.')
     split = world // batch1 if batch1 < world else 1
