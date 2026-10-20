@@ -57,3 +57,22 @@ torchrun --standalone --nproc_per_node=8 train/val/run.py --estimator probe     
 torchrun --standalone --nproc_per_node=8 train/val/run.py --estimator probe --train-rows 2560 --lr-scale 1.5  # 4.2 in 320 updates
 CUDA_VISIBLE_DEVICES=0 python probe/check_probe.py [weights.pt]                                               # the gradient check
 ```
+
+## Optimizer sweep (track 1, seed 0, stopped early)
+
+`probe/sweep/sweep.sh probe/sweep/stage1.txt` from the repository root; results in [`sweep/sweep.tsv`](sweep/sweep.tsv).
+Baseline (#20's recipe) 3.7110. One seed each; the batch-2 run was stopped before it finished.
+
+| change | val loss |
+| - | - |
+| `--cut-batch 4` (4 GPUs, 1220 updates) | 3.6587 |
+| `--anvil-wd 4.0` | 3.7048 |
+| `--lr-scale 1.4` | 3.7085 |
+| `--anvil-wd 1.0` | 3.7174 |
+| `--lr-scale 0.7` | 3.7199 |
+| `--warmdown 0.5` | 3.7250 |
+| `--adam-scale 2` | 3.7321 |
+| `--warmdown 0.7` | 3.7573 |
+
+The maintainers have since ruled (#20) that passing measured credit down block by block is out of bounds, so this
+branch is kept only as a record of the test case.
