@@ -325,6 +325,19 @@ def chain_chunk_bi(site, own, move, scale, e, x0, xins, mids, xL, idx, hs, us, l
 
 
 @torch.compile(dynamic=False)
+def block_chunk(move, scale, mid, idx, hs, w_fc, w_out_t, credit):
+    """One block of chain_chunk_bi: each move of the mid stream crosses this block's MLP (restricted to the token's
+    top-k units, as the chains are) to the block output, and the output's change is scored against the credit already
+    measured there. move (m, P, W); scale (m, P); mid, credit (m, W); idx, hs (m, k). Returns (m, P)."""
+    dz = norm_difference(mid, move)
+    dh = torch.bmm(dz, w_fc[idx].transpose(1, 2))
+    h = hs.unsqueeze(1)
+    up, down = F.relu(h + dh), F.relu(h)
+    delta = move + torch.bmm((up - down) * (up + down), w_out_t[idx])
+    return (delta * credit.unsqueeze(1)).sum(-1) / scale
+
+
+@torch.compile(dynamic=False)
 def key_scores(qp, kp, k_raw, steps, cos, sin, A, C, basis):
     """Single-key experiments, each evaluated exactly: the raw key at position t moves by steps_t e_j and nothing
     else moves, so each query's attention changes in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
@@ -1066,6 +1079,112 @@ class CutBI(Cut):
         return gradients
 
 
+class CutBIR(CutBI):
+    """CutBI with its measurements reordered: the same estimand, at L instead of L (L + 1) / 2 + L block crossings
+    per token per direction.
+
+    CutBI measures each site's credit by one chain per site: a full cycle of moves of the site's stream, each carried
+    forward through every block above (MLPs restricted to the top-k routes, attention held) to the token's loss, with
+    <u_b, norm(xin_b + delta_b) - norm(xin_b)> added at every block input it reaches. The derivative of that chain is
+    a product of the blocks' local maps (route-restricted MLP and identity, the mixing scalar, the norm against u_b),
+    and the chains of different sites share every factor above the lower site. Here each product is accumulated from
+    the top instead: block i's mid-stream credit is a full cycle of moves that cross block i alone, scored against the
+    credit already measured at block i's output; the block's input credit is that plus its own attention's
+    (input_credit against u_i, as in CutBI), and lam_r[i] times it is the output credit of block i - 1. The embedding
+    collects lam_0[b] times every block's input credit (the x0 injections, (lam_r[0] + lam_0[0]) at block 0) and is
+    measured by a full cycle of moves of the raw embedding through its norm. The mixing scalars are the input credit
+    along their own streams (CutBI's central differences of the same linear functional).
+
+    In the limit of small steps both orders compute the same derivatives: with every route and u_b exact, the gradient
+    of the summed loss (both are then the backward pass of the network, CutBI's by forward chains, this one by
+    accumulation from the top). Every measurement is still a forward difference of one of CutBI's own functions or
+    one of its local steps; what changes is which functions are differenced."""
+
+    def block_credit(self, i, c, credit):
+        """Block i's mid-stream credit: a full cycle of moves of each token's mid stream, each crossing block i's
+        route-restricted MLP, scored against the credit at the block output."""
+        s = self.s
+        H = self.basis()
+        mid = c['mids'][i]
+        n, m = mid.shape[0], s.chain_tokens
+        steps = s.chain_sigma * mid.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        idx, hs = c['routes'][i]
+        out = torch.empty(n, WIDTH, device=self.device)
+        for t0 in range(0, n, m):
+            sl = slice(t0, t0 + m)
+            move, scale = steps[sl].unsqueeze(-1) * H.unsqueeze(0), steps[sl].expand(-1, WIDTH)
+            derivative = block_chunk(move, scale, mid[sl], idx[sl], hs[sl], c['w_fc'][i], c['w_out_t'][i], credit[sl])
+            out[sl] = derivative @ H / WIDTH
+        return out
+
+    def embedding_credit(self, e, credit):
+        """The raw embedding's credit: a full cycle of moves of each token's embedding through its norm, scored
+        against the credit at x0."""
+        H = self.basis()
+        steps = self.s.chain_sigma * e.square().mean(-1, keepdim=True).sqrt().clamp(min=1e-6)
+        out = torch.empty_like(e)
+        for t0 in range(0, len(e), self.s.chain_tokens):
+            sl = slice(t0, t0 + self.s.chain_tokens)
+            move = steps[sl].unsqueeze(-1) * H.unsqueeze(0)
+            out[sl] = (norm_difference(e[sl], move) * credit[sl].unsqueeze(1)).sum(-1) / steps[sl] @ H / WIDTH
+        return out
+
+    @torch.no_grad()
+    def estimate(self, x, y):
+        d, model, s = self.capture, self.model, self.s
+        d.capture(x, y)
+        L = model.config.n_layer
+        b, t = x.shape
+        yf = y.flatten()
+        valid = (yf >= 0).float().unsqueeze(-1)
+        gradients = {'lm_head.weight': d.reassemble('lm_head', d.head_error())}
+        e = d.outputs['transformer.wte'].float().flatten(0, 1)
+        xins, mids, outs, routes = [], [], [], []
+        for i in range(L):
+            p = f'transformer.h.{i}.'
+            xin = d.blocks[i].float().flatten(0, 1)
+            mid = xin + d.outputs[p + 'attn.c_proj'].float().flatten(0, 1)
+            mlp = model.transformer.h[i].mlp
+            hpre = F.linear(norm(mid), mlp.c_fc.weight.float())
+            r = F.relu(hpre).square()
+            out = mid + F.linear(r, mlp.c_proj.weight.float())
+            top = (r * mlp.c_proj.weight.float().norm(dim=0)).topk(s.route_k, dim=-1).indices
+            xins.append(xin), mids.append(mid), outs.append(out), routes.append((top, hpre.gather(1, top)))
+        c = dict(mids=mids, routes=routes,
+                 w_fc=[blk.mlp.c_fc.weight.float() for blk in model.transformer.h],
+                 w_out_t=[blk.mlp.c_proj.weight.float().T.contiguous() for blk in model.transformer.h])
+        lam_r, lam_0 = model.resid_lambdas.float(), model.x0_lambdas.float()
+        x0 = norm(e)
+        self.maps = {}
+        scalars = torch.zeros(2, L, device=self.device)
+        d_out = self.probe(outs[-1], yf) * valid  # the top stream's credit (CutBI's chains end at the same loss)
+        d_x0 = torch.zeros_like(e)
+        for i in reversed(range(L)):  # from the top: block i's output credit is complete
+            p = f'transformer.h.{i}.'
+            block = model.transformer.h[i]
+            gradients[p + 'mlp.c_proj.weight'] = d_out.T @ d.inputs[p + 'mlp.c_proj'].flatten(0, 1)
+            hidden = self.hidden_credit(d.outputs[p + 'mlp.c_fc'].float().flatten(0, 1), d_out, block.mlp.c_proj.weight)
+            gradients[p + 'mlp.c_fc.weight'] = hidden.T @ d.inputs[p + 'mlp.c_fc'].flatten(0, 1)
+            d_mid = self.block_credit(i, c, d_out)
+            gradients[p + 'attn.c_proj.weight'] = d_mid.T @ d.inputs[p + 'attn.c_proj'].flatten(0, 1)
+            u = self.layer_internals(i, (d_mid @ block.attn.c_proj.weight.float()).view(b, t, WIDTH), gradients)
+            d_in = d_mid + self.input_credit(xins[i], u)
+            prev = x0 if i == 0 else outs[i - 1]
+            scalars[:, i] = torch.stack([(d_in * prev).sum(), (d_in * x0).sum()])
+            if i:
+                d_x0 += lam_0[i] * d_in
+                d_out = lam_r[i] * d_in
+            else:
+                d_x0 += (lam_r[0] + lam_0[0]) * d_in
+        emb = self.embedding_credit(e, d_x0)
+        gradients['transformer.wte.weight'] = d.reassemble('transformer.wte', emb.view(b, t, WIDTH))
+        gradients['resid_lambdas'], gradients['x0_lambdas'] = scalars[0], scalars[1]
+        for name, p in model.named_parameters():
+            if name not in gradients:
+                gradients[name] = torch.zeros_like(p, dtype=torch.float32)
+        return gradients
+
+
 class DFA(Cut):
     """Baseline (direct feedback alignment): Cut with every site's credit replaced by a fixed random projection of the
     exact output error (the coordinate head's logit credit), e @ B_site, B_site ~ N(0, 1 / V) drawn once from a fixed
@@ -1238,9 +1357,9 @@ def main():
     parser.add_argument('--seed', type=int, default=SEED)
     parser.add_argument('--switch', type=float, default=0.3, help='Fraction of the epoch trained by Boost.')
     parser.add_argument('--route-k', type=int, default=0, help='Cut: MLP units per token per block (0: hidden/16).')
-    parser.add_argument('--estimator', choices=('cut', 'cutbi', 'dfa'), default='cutbi', help='Phase 2 (cutbi: Cut '
-                        'with the attention externalities by backward induction; dfa: the direct feedback alignment '
-                        'baseline).')
+    parser.add_argument('--estimator', choices=('cut', 'cutbi', 'cutbir', 'dfa'), default='cutbi', help='Phase 2 '
+                        '(cutbi: Cut with the attention externalities by backward induction; cutbir: the same with its '
+                        'measurements reordered block by block; dfa: the direct feedback alignment baseline).')
     parser.add_argument('--keys', choices=('exact', 'sampled'), default='exact', help='Cut\'s keys.')
     parser.add_argument('--boost-keys', choices=('exact', 'sampled'), default='exact', help='Boost\'s keys.')
     parser.add_argument('--train-file', default='train.pt')
@@ -1317,7 +1436,7 @@ def main():
     estimator.close()
     model = make_model(device, args.seed, config)
     optimizer = make_optimizer(model, recipe, steps2)
-    Phase2 = dict(cut=Cut, cutbi=CutBI, dfa=DFA)[args.estimator]
+    Phase2 = dict(cut=Cut, cutbi=CutBI, cutbir=CutBIR, dfa=DFA)[args.estimator]
     estimator = Phase2(model, settings, args.seed, rank, world)
     mine = slice(rank * per2, (rank + 1) * per2)
     estimator.step(noise[mine, :-1].contiguous(), noise[mine, 1:].contiguous(), optimizer)
